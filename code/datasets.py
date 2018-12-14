@@ -15,6 +15,8 @@ import torchvision.transforms as transforms
 
 import os
 import sys
+import h5py
+from tqdm import tqdm
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -58,7 +60,10 @@ def prepare_data(data):
 
 def get_imgs(img_path, imsize, bbox=None,
              transform=None, normalize=None):
-    img = Image.open(img_path).convert('RGB')
+    if isinstance(img_path, str):
+        img = Image.open(img_path).convert('RGB')
+    else:
+        img = Image.fromarray(img_path)
     width, height = img.size
     if bbox is not None:
         r = int(np.maximum(bbox[2], bbox[3]) * 0.75)
@@ -104,7 +109,6 @@ class TextDataset(data.Dataset):
             self.imsize.append(base_size)
             base_size = base_size * 2
 
-        self.data = []
         self.data_dir = data_dir
         if data_dir.find('birds') != -1:
             self.bbox = self.load_bbox()
@@ -115,7 +119,13 @@ class TextDataset(data.Dataset):
         self.filenames, self.captions, self.ixtoword, \
             self.wordtoix, self.n_words = self.load_text_data(data_dir, split)
 
-        self.class_id = self.load_class_id(split_dir, len(self.filenames))
+        if data_dir.find('fashion') != -1:
+            h5_file = '%s/fashiongen_256_256_%s.h5' % (data_dir, split)
+            self.data = h5py.File(h5_file, 'r')
+            self.class_id = self.load_fashion_class_id()
+        else:
+            self.class_id = self.load_class_id(split_dir, len(self.filenames))
+
         self.number_example = len(self.filenames)
 
     def load_bbox(self):
@@ -176,6 +186,42 @@ class TextDataset(data.Dataset):
                           % (filenames[i], cnt))
         return all_captions
 
+    def load_fashion_caption(self, data_dir, split):
+        all_captions = []
+        h5_file = '%s/fashiongen_256_256_%s.h5' % (data_dir, split)
+        h5_data = h5py.File(h5_file, 'r')
+        for i in tqdm(range(len(h5_data['index_2']))):
+            filename = h5_data['input_name'][i]
+            captions = h5_data['input_description'][i][0].\
+                decode('utf8', errors="ignore").split('\n')
+            cnt = 0
+            for cap in captions:
+                if len(cap) == 0:
+                    continue
+                cap = cap.replace("\ufffd\ufffd", " ")
+                # picks out sequences of alphanumeric characters as tokens
+                # and drops everything else
+                tokenizer = RegexpTokenizer(r'\w+')
+                tokens = tokenizer.tokenize(cap.lower())
+                # print('tokens', tokens)
+                if len(tokens) == 0:
+                    print('cap', cap)
+                    continue
+
+                tokens_new = []
+                for t in tokens:
+                    t = t.encode('ascii', 'ignore').decode('ascii')
+                    if len(t) > 0:
+                        tokens_new.append(t)
+                all_captions.append(tokens_new)
+                cnt += 1
+                if cnt == self.embeddings_num:
+                    break
+            if cnt < self.embeddings_num:
+                print('ERROR: the captions for %s less than %d'
+                      % (filename, cnt))
+        return all_captions
+
     def build_dictionary(self, train_captions, test_captions):
         word_counts = defaultdict(float)
         captions = train_captions + test_captions
@@ -218,11 +264,21 @@ class TextDataset(data.Dataset):
 
     def load_text_data(self, data_dir, split):
         filepath = os.path.join(data_dir, 'captions.pickle')
-        train_names = self.load_filenames(data_dir, 'train')
-        test_names = self.load_filenames(data_dir, 'test')
+
+        if data_dir.find('fashion') != -1:
+            train_names = self.load_fashion_filenames(data_dir, 'train')
+            test_names = self.load_fashion_filenames(data_dir, 'test')
+        else:
+            train_names = self.load_filenames(data_dir, 'train')
+            test_names = self.load_filenames(data_dir, 'test')
+
         if not os.path.isfile(filepath):
-            train_captions = self.load_captions(data_dir, train_names)
-            test_captions = self.load_captions(data_dir, test_names)
+            if data_dir.find('fashion') != -1:
+                train_captions = self.load_fashion_caption(data_dir, 'train')
+                test_captions = self.load_fashion_caption(data_dir, 'test')
+            else:
+                train_captions = self.load_captions(data_dir, train_names)
+                test_captions = self.load_captions(data_dir, test_names)
 
             train_captions, test_captions, ixtoword, wordtoix, n_words = \
                 self.build_dictionary(train_captions, test_captions)
@@ -256,6 +312,14 @@ class TextDataset(data.Dataset):
             class_id = np.arange(total_num)
         return class_id
 
+    def load_fashion_class_id(self):
+        class_names = np.unique(self.data['input_category'])
+        class_ids = range(1, len(class_names)+1)
+        class_name_to_id = dict(zip(class_names, class_ids))
+        sample_id = [class_name_to_id[x[0]] for x in self.data['input_category']]
+
+        return sample_id
+
     def load_filenames(self, data_dir, split):
         filepath = '%s/%s/filenames.pickle' % (data_dir, split)
         if os.path.isfile(filepath):
@@ -264,6 +328,12 @@ class TextDataset(data.Dataset):
             print('Load filenames from: %s (%d)' % (filepath, len(filenames)))
         else:
             filenames = []
+        return filenames
+
+    def load_fashion_filenames(self, data_dir, split):
+        h5_file = '%s/fashiongen_256_256_%s.h5' % (data_dir, split)
+        h5_data = h5py.File(h5_file, 'r')
+        filenames = h5_data['index_2']
         return filenames
 
     def get_caption(self, sent_ix):
@@ -298,7 +368,10 @@ class TextDataset(data.Dataset):
             bbox = None
             data_dir = self.data_dir
         #
-        img_name = '%s/images/%s.jpg' % (data_dir, key)
+        if self.data_dir.find('fashion') != -1:
+            img_name = self.data['input_image'][index]
+        else:
+            img_name = '%s/images/%s.jpg' % (data_dir, key)
         imgs = get_imgs(img_name, self.imsize,
                         bbox, self.transform, normalize=self.norm)
         # random select a sentence
@@ -306,7 +379,6 @@ class TextDataset(data.Dataset):
         new_sent_ix = index * self.embeddings_num + sent_ix
         caps, cap_len = self.get_caption(new_sent_ix)
         return imgs, caps, cap_len, cls_id, key
-
 
     def __len__(self):
         return len(self.filenames)
